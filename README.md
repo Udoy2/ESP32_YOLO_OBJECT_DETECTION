@@ -34,7 +34,7 @@ pip install requests opencv-python numpy ultralytics pyttsx3 pillow
 ### 🔧 Running the Program
 1. Run the Python script:
    ```bash
-   python esp32_object_detector.py
+   python main.py
    ```
 2. Press `q` to exit the program.
 
@@ -46,7 +46,7 @@ pip install requests opencv-python numpy ultralytics pyttsx3 pillow
 ## 🗋 File Structure
 ```
 ESP32_Object_Detector/
-├── esp32_object_detector.py   # Main script
+├── main.py   # Main script
 ├── captured_images/           # Directory for saved images
 └── README.md                  # Project documentation
 ```
