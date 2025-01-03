@@ -8,77 +8,125 @@ import io
 import time
 import os
 from datetime import datetime
+import socket
+import netifaces
+import concurrent.futures
+from typing import Optional
 
 class ESP32ObjectDetector:
-    def __init__(self, esp32_url, capture_interval=2):
-        """
-        Initialize the detector
-        
-        Args:
-            esp32_url (str): Base URL of ESP32 camera (e.g., 'http://192.168.0.161')
-            capture_interval (int): Seconds between captures
-        """
-        self.esp32_url = esp32_url.rstrip('/')
+    def __init__(self, capture_interval=2):
         self.capture_interval = capture_interval
-        
-        # Initialize YOLO model
-        self.model = YOLO('yolov8n.pt')  # Using the smallest YOLOv8 model for speed
-        
-        # Initialize text-to-speech engine
+        self.esp32_url = None
+        self.model = YOLO('yolov8n.pt')
         self.engine = pyttsx3.init()
-        self.engine.setProperty('rate', 150)  # Speed of speech
-        
-        # Keep track of last announced objects to avoid repetition
+        self.engine.setProperty('rate', 150)
         self.last_announced = set()
-        
-        # Create output directory for saved images
         self.output_dir = 'captured_images'
         os.makedirs(self.output_dir, exist_ok=True)
         
-        # Create a window for display
+        # Find ESP32 camera
+        self.discover_esp32()
+        if not self.esp32_url:
+            raise Exception("Could not find ESP32 camera on the network")
+        
         cv2.namedWindow('ESP32 Camera Feed', cv2.WINDOW_NORMAL)
 
-    def capture_image(self):
-        """Capture still image from ESP32 camera"""
+    def verify_esp32_camera(self, ip: str) -> Optional[str]:
+        """Verify if IP hosts an ESP32 camera by checking image capture"""
+        base_url = f"http://{ip}"
         try:
-            # Add timestamp to prevent caching
-            capture_url = f"{self.esp32_url}/capture?_cb={int(time.time())}"
-            response = requests.get(capture_url, timeout=10)
-            
-            if response.status_code == 200:
-                # Convert response content to image
-                image = Image.open(io.BytesIO(response.content))
-                return cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-            else:
-                print(f"Failed to capture image. Status code: {response.status_code}")
+            # First check if server responds
+            status = requests.get(f"{base_url}/status", timeout=1)
+            if status.status_code != 200:
                 return None
-        except Exception as e:
-            print(f"Error capturing image: {str(e)}")
+                
+            # Then verify camera functionality
+            capture = requests.get(f"{base_url}/capture", timeout=2)
+            if capture.status_code != 200:
+                return None
+                
+            # Verify we got an image
+            try:
+                Image.open(io.BytesIO(capture.content))
+                print(f"Valid ESP32 camera found at: {base_url}")
+                return base_url
+            except:
+                return None
+                
+        except requests.RequestException:
             return None
 
+    def get_default_gateway_network(self) -> tuple:
+        """Get default gateway IP and network range"""
+        gateways = netifaces.gateways()
+        if 'default' not in gateways or netifaces.AF_INET not in gateways['default']:
+            raise Exception("Default gateway not found")
+            
+        gateway = gateways['default'][netifaces.AF_INET][0]
+        base_ip = '.'.join(gateway.split('.')[:3])
+        
+        reverse_ip = None
+        # Calculate reverse IP based on third octet
+        third_octet = int(gateway.split('.')[-2])
+        if(third_octet != '0' or third_octet != '1'):
+            reverse_third = '1' if third_octet == 0 else '0'
+            reverse_ip = f"{'.'.join(gateway.split('.')[:2])}.{reverse_third}"
+        
+        return (base_ip, reverse_ip)
+
+    def discover_esp32(self):
+        """Find ESP32 camera using parallel network scanning with reverse IP support"""
+        base_ip, reverse_ip = self.get_default_gateway_network()
+        if reverse_ip==None:
+            networks = [base_ip]
+        networks = [base_ip, reverse_ip]
+        
+        for network in networks:
+            print(f"Scanning network: {network}.0/24")
+            
+            with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
+                future_to_ip = {
+                    executor.submit(self.verify_esp32_camera, f"{network}.{i}"): i 
+                    for i in range(1, 255)
+                }
+                
+                for future in concurrent.futures.as_completed(future_to_ip):
+                    result = future.result()
+                    if result:
+                        self.esp32_url = result
+                        return
+
+        raise Exception("Could not find ESP32 camera on any network")
+
+    def capture_image(self):
+        """Capture image from ESP32 camera"""
+        try:
+            response = requests.get(f"{self.esp32_url}/capture?_cb={int(time.time())}", timeout=5)
+            if response.status_code == 200:
+                image = Image.open(io.BytesIO(response.content))
+                return cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+        except Exception as e:
+            print(f"Error capturing image: {str(e)}")
+        return None
+
+    # Rest of the class methods remain the same
     def detect_objects(self, image):
-        """Run object detection on image and return results"""
         if image is None:
             return set(), None
         
-        results = self.model(image, conf=0.5)  # Only detections with 50% or higher confidence
+        results = self.model(image, conf=0.5)
         detected_objects = set()
-        
-        # Create a copy of the image for drawing
         annotated_image = image.copy()
         
         for result in results:
             for box in result.boxes:
-                # Get box coordinates and class info
                 coords = box.xyxy[0].cpu().numpy()
                 class_id = int(box.cls[0])
                 class_name = result.names[class_id]
                 confidence = float(box.conf[0])
                 
-                # Add to detected objects set
                 detected_objects.add(class_name)
                 
-                # Draw rectangle and label on image
                 x1, y1, x2, y2 = map(int, coords)
                 cv2.rectangle(annotated_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
                 label = f"{class_name} {confidence:.2f}"
@@ -88,26 +136,21 @@ class ESP32ObjectDetector:
         return detected_objects, annotated_image
 
     def save_image(self, image, objects):
-        """Save the annotated image with timestamp and detected objects"""
         if image is None or not objects:
             return
         
-        # Create filename with timestamp and detected objects
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         objects_str = "-".join(sorted(objects))
         filename = f"{timestamp}_{objects_str}.jpg"
         filepath = os.path.join(self.output_dir, filename)
         
-        # Save image
         cv2.imwrite(filepath, image)
         print(f"Saved image: {filepath}")
 
     def announce_objects(self, objects):
-        """Announce detected objects using text-to-speech"""
         if not objects:
             return
         
-        # Only announce new objects
         new_objects = objects - self.last_announced
         if new_objects:
             objects_text = ", ".join(new_objects)
@@ -118,29 +161,23 @@ class ESP32ObjectDetector:
         self.last_announced = objects
 
     def run(self):
-        """Main detection loop"""
         print("Starting object detection...")
         print(f"Saving images to: {os.path.abspath(self.output_dir)}")
         try:
             while True:
-                # Capture and process image
                 image = self.capture_image()
                 if image is not None:
                     detected_objects, annotated_image = self.detect_objects(image)
                     
                     if detected_objects:
-                        # Save and announce detected objects
                         self.save_image(annotated_image, detected_objects)
                         self.announce_objects(detected_objects)
                     
-                    # Display the image
                     cv2.imshow('ESP32 Camera Feed', annotated_image)
                     
-                    # Break loop if 'q' is pressed
                     if cv2.waitKey(1) & 0xFF == ord('q'):
                         break
                 
-                # Wait before next capture
                 time.sleep(self.capture_interval)
                 
         except KeyboardInterrupt:
@@ -151,10 +188,7 @@ class ESP32ObjectDetector:
             cv2.destroyAllWindows()
 
 def main():
-    # Replace with your ESP32's IP address
-    ESP32_URL = "http://192.168.0.161"
-    
-    detector = ESP32ObjectDetector(ESP32_URL)
+    detector = ESP32ObjectDetector()
     detector.run()
 
 if __name__ == "__main__":
